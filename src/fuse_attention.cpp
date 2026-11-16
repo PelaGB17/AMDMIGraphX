@@ -33,6 +33,7 @@
 #include <migraphx/generic_float.hpp>
 #include <migraphx/dead_code_elimination.hpp>
 #include <migraphx/float_equal.hpp>
+#include <migraphx/fp8_types.hpp>
 #include <migraphx/split_factor.hpp>
 #include <migraphx/tensor_view.hpp>
 #include <migraphx/literal.hpp>
@@ -143,6 +144,16 @@ bool is_inlinable_constant(instruction_ref ins)
         return true;
     return ins->get_shape().elements() == 1 or is_range_literal(ins->get_literal());
 }
+
+MIGRAPHX_PRED_MATCHER(has_fp8_inputs, instruction_ref ins)
+{
+    return std::any_of(ins->inputs().begin(), ins->inputs().end(), [](instruction_ref input) {
+        return contains(fp8_types{}.get(), input->get_shape().type());
+    });
+}
+
+// rocMLIR does not support fp8 attention, so an fp8 dot is left for fuse_mlir to take on its own
+auto non_fp8_dot() { return match::name("dot")(match::none_of(has_fp8_inputs())); }
 
 // Profitability gate shared by the attention matchers: the fused kernel keeps a head-dim
 // wide accumulator per q row in registers (loses past max_head_dim unless the kv loop is
@@ -472,8 +483,7 @@ struct find_transposed_attention
 
     auto matcher() const
     {
-        auto gemm1 =
-            match::opaque(match::any_of[pointwise_inputs()](match::name("dot").bind("dot1")));
+        auto gemm1 = match::opaque(match::any_of[pointwise_inputs()](non_fp8_dot().bind("dot1")));
         auto softmax =
             match::opaque(match::skip(match::name("convert"))(match::softmax_input(gemm1)));
         auto swap_last_two = match::make_basic_pred_matcher([](instruction_ref ins) {
@@ -489,7 +499,7 @@ struct find_transposed_attention
             match::opaque(match::name("transpose")(swap_last_two, match::arg(0)(softmax))
                               .bind("transposed_softmax"));
         auto input_of_dot2 = match::any().bind("input_of_dot2");
-        return match::name("dot")(match::arg(0)(input_of_dot2), match::arg(1)(transposed_softmax));
+        return non_fp8_dot()(match::arg(0)(input_of_dot2), match::arg(1)(transposed_softmax));
     }
 
     void apply(module_pass_manager& mpm, const match::matcher_result& r) const
@@ -538,11 +548,10 @@ struct find_attention
 
     auto matcher() const
     {
-        auto gemm1 =
-            match::opaque(match::any_of[pointwise_inputs()](match::name("dot").bind("dot1")));
+        auto gemm1 = match::opaque(match::any_of[pointwise_inputs()](non_fp8_dot().bind("dot1")));
         auto softmax =
             match::opaque(match::skip(match::name("convert"))(match::softmax_input(gemm1)));
-        return match::name("dot")(match::arg(0)(softmax));
+        return non_fp8_dot()(match::arg(0)(softmax));
     }
 
     std::string get_count() const { return std::to_string((*counter)++); }
@@ -1205,7 +1214,7 @@ struct find_kv_cache_attention
             match::skip(match::name(skip_set))(match::name("concat_past_present")).bind("pres_k"));
         auto keys_transpose  = match::opaque(match::name("transpose")(match::arg(0)(keys)));
         auto k_transpose     = match::opaque(match::skip(match::name(skip_set))(keys_transpose));
-        auto gemm1 = match::opaque(match::name("dot")(match::arg(1)(k_transpose)).bind("gemm1"));
+        auto gemm1 = match::opaque(non_fp8_dot()(match::arg(1)(k_transpose)).bind("gemm1"));
         auto gemm1_maybe_cvt = match::opaque(match::skip(match::name("convert"))(gemm1));
         auto scale    = match::opaque(match::name("mul")(match::any_arg(0, 1)(gemm1_maybe_cvt)));
         auto constant = match::opaque(match::is_constant());
@@ -1235,7 +1244,7 @@ struct find_kv_cache_attention
             match::opaque(match::skip(match::name("convert"))(match::softmax_input(mask_cvt)));
         auto values = match::opaque(
             match::skip(match::name(skip_set))(match::name("concat_past_present")).bind("pres_v"));
-        return match::name("dot")(match::arg(0)(attn_probabilities), match::arg(1)(values));
+        return non_fp8_dot()(match::arg(0)(attn_probabilities), match::arg(1)(values));
     }
 
     /// The view ops laying out the attention output after the second gemm,
